@@ -120,5 +120,18 @@
 
   <footer>Made by Abhishek Kanodia · <a href="privacy.html">Privacy</a> · Not affiliated with YouTube or Google.</footer>
 </div>
+<script>
+// Counts visits with a random id (no names, no IPs). Same counter as the player.
+try {
+  let id = localStorage.getItem('mf:uid'); id = id && JSON.parse(id);
+  if (typeof id !== 'string' || !/^[a-z0-9]{8,40}$/.test(id)) {
+    id = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(36).padStart(2, '0')).join('').slice(0, 20);
+    localStorage.setItem('mf:uid', JSON.stringify(id));
+  }
+  let ref = new URLSearchParams(location.search).get('utm_source') || '';
+  if (!ref) try { ref = new URL(document.referrer).hostname.replace(/^www\./, ''); if (ref === location.hostname) ref = ''; if (ref === 't.co') ref = 'x.com'; } catch {}
+  navigator.sendBeacon('https://music-focus-stats.nikola-tesla-odin.workers.dev/e', JSON.stringify({ uid: id, type: 'visit', page: 'landing', ref }));
+} catch {}
+</script>
 </body>
 </html>

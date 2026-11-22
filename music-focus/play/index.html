@@ -276,11 +276,12 @@
       <input id="link" type="url" inputmode="url" placeholder="Paste a YouTube song or playlist link" aria-label="YouTube link">
       <button type="submit">Play</button>
     </form>
-    <p class="hint">Drag your finger around the wheel. Press <b>MENU</b> for playlists and Brick.<span class="keys"><br>On a keyboard: arrows turn, <kbd>Enter</kbd> selects, <kbd>Esc</kbd> is MENU, <kbd>Space</kbd> plays.</span></p>
+    <p class="hint">Drag your finger around the wheel. Paste any song and it keeps going with music like it. Press <b>MENU</b> for playlists and Brick.<span class="keys"><br>On a keyboard: arrows turn, <kbd>Enter</kbd> selects, <kbd>Esc</kbd> is MENU, <kbd>Space</kbd> plays.</span></p>
   </main>
   <footer>Made by Abhishek Kanodia · Plays through YouTube · Not affiliated with YouTube, Google or Apple</footer>
 </div>
 <div class="toast" id="toast" role="status"></div>
+<div id="scouts" aria-hidden="true" style="position:fixed;left:-10000px;top:0;width:200px;height:200px;overflow:hidden"></div>
 
 <script>
 // ---------- Music ----------
@@ -335,6 +336,7 @@ const PLAYLISTS = [
 ].map((p) => ({ name: p.name, songs: p.songs.map(([id, title, artist]) => ({ id, title, artist })) }));
 
 const SITE = 'https://kanodia.github.io/music-focus/play/';
+const STATS_URL = 'https://music-focus-stats.nikola-tesla-odin.workers.dev/e';
 
 // ---------- Small helpers ----------
 const $ = (id) => document.getElementById(id);
@@ -380,6 +382,75 @@ function toast(msg) {
 }
 const thumb = (id) => `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
 
+// ---------- Usage counting (our own counter; a random id, no names, no IPs) ----------
+function randomId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(36).padStart(2, '0')).join('').slice(0, 20);
+}
+const uid = (() => {
+  let id = store.get('uid', null);
+  if (typeof id !== 'string' || !/^[a-z0-9]{8,40}$/.test(id)) { id = randomId(); store.set('uid', id); }
+  return id;
+})();
+const sid = randomId();
+function track(type, extra = {}) {
+  try {
+    const body = JSON.stringify({ uid, sid, page: 'player', type, ...extra });
+    if (!navigator.sendBeacon?.(STATS_URL, body)) fetch(STATS_URL, { method: 'POST', body, keepalive: true, mode: 'no-cors' });
+  } catch { /* counting must never break the player */ }
+}
+function referrer() {
+  const p = new URLSearchParams(location.search);
+  if (p.get('utm_source')) return p.get('utm_source');
+  try {
+    const h = new URL(document.referrer).hostname.replace(/^www\./, '');
+    if (h === location.hostname) return '';
+    return h === 't.co' ? 'x.com' : h;
+  } catch { return ''; }
+}
+// Seconds of actual playback, sent in chunks.
+let listened = 0;
+function flushListen(min = 1) {
+  if (listened >= min) { track('listen', { value: Math.round(listened) }); listened = 0; }
+}
+addEventListener('pagehide', () => flushListen());
+document.addEventListener('visibilitychange', () => { if (document.hidden) flushListen(); });
+
+// ---------- Song names ----------
+// YouTube titles are messy ("Song (Official Video) [4K] | Movie | Label"); keep the song and artist.
+const meta = new Map(); // id -> { title, artist } or null when it can't be embedded
+const squash = (s) => s.toLowerCase().replace(/vevo$|official|-\s*topic$|[^a-z0-9]/g, '');
+function tidy(raw, author = '') {
+  let t = raw.replace(/\s*[(\[][^)\]]*(official|video|audio|lyric|4k|hd|remaster|full song|visuali[sz]er|upgrade)[^)\]]*[)\]]/gi, '');
+  t = t.split(/\s+[|｜]\s*|\s+\/\/\s+/)[0].replace(/^full (video|song|audio):?\s*/i, '').trim();
+  // "Song – Official Video", "Song (Song): Singer"
+  t = t.replace(/\s+[-–—]\s*(official|lyrical|lyric|full|audio|video|4k|hd)\b.*$/i, '').replace(/\s*\((song|audio|bonus track)\)/gi, '').trim();
+  const colon = !/\s[-–—]\s/.test(t) && t.match(/^([^:]{2,40}):\s+(.+)$/);
+  if (colon) return { title: titleCase(colon[1].trim()), artist: colon[2].trim() };
+  let artist = author.replace(/VEVO$|\s*-\s*Topic$|\bOfficial\b/gi, '').trim();
+  const m = t.match(/^(.+?)\s+[-–—]\s+(.+)$/);
+  if (m) {
+    const a = squash(author);
+    if (a && (a.includes(squash(m[1])) || squash(m[1]).includes(a))) { artist = m[1].trim(); t = m[2].trim(); }
+    else if (a && (a.includes(squash(m[2])) || squash(m[2]).includes(a))) { artist = m[2].trim(); t = m[1].trim(); }
+    else { t = m[1].trim(); artist = m[2].trim(); }
+  }
+  return { title: titleCase(t) || raw, artist };
+}
+// "KHAIRIYAT" -> "Khairiyat"; leaves normal titles alone.
+function titleCase(t) {
+  return /[a-z]/.test(t) || t.length < 4 ? t : t.toLowerCase().replace(/(^|\s)\S/g, (c) => c.toUpperCase());
+}
+async function fetchMeta(id) {
+  if (meta.has(id)) return meta.get(id);
+  try {
+    const r = await fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent('https://www.youtube.com/watch?v=' + id)}`);
+    let m = null;
+    if (r.ok) { const d = await r.json(); m = tidy(d.title, d.author_name); }
+    meta.set(id, m);
+    return m;
+  } catch { return undefined; }
+}
+
 // ---------- Elements ----------
 const root = $('ipod');
 $('state').append(icon('play', 'is-playing'), icon('pause', 'is-paused'));
@@ -388,8 +459,10 @@ $('l-next').append(icon('next'));
 $('l-pp').append(icon('play'), icon('pause'));
 
 // ---------- Queue ----------
-// Either our own list of songs, or a YouTube playlist that YouTube steps through.
-const q = { songs: [], index: 0, listId: null, name: '' };
+// Either our own list of songs (which grows into a radio when it nears the end),
+// or a pasted YouTube playlist that YouTube steps through.
+const q = { songs: [], index: 0, listId: null, name: '', gen: 0 };
+const radio = { seeds: new Set(), busy: false, advance: false };
 let player = null;
 let ready = false;
 let pending = null; // what to load once the player is ready
@@ -397,7 +470,8 @@ let pending = null; // what to load once the player is ready
 function current() {
   if (q.listId) {
     const d = player?.getVideoData?.() || {};
-    return { id: d.video_id, title: d.title || 'Loading…', artist: d.author || '' };
+    const m = d.title ? tidy(d.title, d.author) : null;
+    return { id: d.video_id, title: m?.title || 'Loading…', artist: m?.artist || '' };
   }
   return q.songs[q.index];
 }
@@ -409,7 +483,7 @@ function showTrack() {
   $('artist').textContent = s.artist || '';
   $('count').textContent = q.listId
     ? (player?.getPlaylist?.() ? `${(player.getPlaylistIndex() ?? 0) + 1} of ${player.getPlaylist().length}` : '')
-    : q.songs.length > 1 ? `${q.index + 1} of ${q.songs.length}` : '';
+    : q.songs.length > 1 ? `${q.index + 1} of ${q.songs.length}` : radio.busy ? 'Building a mix…' : '';
   if (s.id) {
     $('cover').src = thumb(s.id);
     const bg = $('bgart');
@@ -419,18 +493,24 @@ function showTrack() {
       bg.dataset.id = s.id;
       bg.src = thumb(s.id);
     }
-    document.title = `${s.title} · Music Focus`;
+    if (s.title) document.title = `${s.title} · Music Focus`;
   }
 }
 
 function playSongs(songs, index = 0, name = '', autoplay = true) {
-  q.songs = songs; q.index = index; q.listId = null; q.name = name;
+  q.gen++;
+  q.songs = songs.map((s) => ({ ...s }));
+  q.index = index; q.listId = null; q.name = name;
+  radio.seeds.clear(); radio.busy = false; radio.advance = false;
   root.classList.remove('playing-once');
   showTrack();
-  load(songs[index].id, autoplay);
+  load(q.songs[index].id, autoplay);
+  maybeExtend();
+  prefetch();
 }
 
 function playList(listId, autoplay = true) {
+  q.gen++;
   q.songs = []; q.index = 0; q.listId = listId; q.name = 'Playlist';
   $('title').textContent = 'Loading playlist…'; $('artist').textContent = ''; $('count').textContent = '';
   if (!ready) { pending = { list: listId, autoplay }; return; }
@@ -443,13 +523,25 @@ function load(id, autoplay) {
   if (autoplay) player.loadVideoById(id); else player.cueVideoById(id);
 }
 
+function goTo(i) {
+  q.index = i;
+  showTrack();
+  load(q.songs[i].id, true);
+  maybeExtend();
+  prefetch();
+}
+
 function next() {
   if (!ready) return;
   if (q.listId) return player.nextVideo();
   if (!q.songs.length) return;
-  q.index = (q.index + 1) % q.songs.length;
-  showTrack();
-  load(q.songs[q.index].id, true);
+  let i = q.index + 1;
+  while (i < q.songs.length && q.songs[i].bad) i++;
+  if (i >= q.songs.length) {
+    if (radio.busy) { radio.advance = true; $('count').textContent = 'Finding more music…'; return; }
+    i = 0;
+  }
+  goTo(i);
 }
 
 function previous() {
@@ -458,9 +550,9 @@ function previous() {
   if (player.getCurrentTime() > 3) return player.seekTo(0, true);
   if (q.listId) return player.previousVideo();
   if (!q.songs.length) return;
-  q.index = (q.index - 1 + q.songs.length) % q.songs.length;
-  showTrack();
-  load(q.songs[q.index].id, true);
+  let i = q.index - 1;
+  while (i > 0 && q.songs[i].bad) i--;
+  goTo(i < 0 ? q.songs.length - 1 : i);
 }
 
 function togglePlay() {
@@ -469,6 +561,91 @@ function togglePlay() {
   const st = player.getPlayerState();
   if (st === YT.PlayerState.PLAYING || st === YT.PlayerState.BUFFERING) player.pauseVideo();
   else { player.unMute(); player.playVideo(); }
+}
+
+// ---------- Radio: when a queue nears its end, add songs like the current one ----------
+// YouTube builds a "Mix" (list RD<id>) of related songs for any song. A hidden,
+// never-playing player reads that list; we add the songs to our own queue.
+function harvest(seed) {
+  return new Promise((resolve) => {
+    const box = document.createElement('div');
+    $('scouts').append(box);
+    let sp = null, poll = 0;
+    const done = (ids) => {
+      clearTimeout(timer); clearInterval(poll);
+      try { sp?.destroy(); } catch {}
+      $('scouts').replaceChildren();
+      resolve(ids);
+    };
+    const timer = setTimeout(() => done([]), 12000);
+    try {
+      sp = new YT.Player(box, {
+        width: '200', height: '200',
+        playerVars: { list: 'RD' + seed, listType: 'playlist', autoplay: 0, mute: 1, controls: 0 },
+        events: {
+          onReady: () => { poll = setInterval(() => { const l = sp.getPlaylist?.(); if (l?.length) done(l); }, 300); },
+          onError: () => done([]),
+        },
+      });
+    } catch { done([]); }
+  });
+}
+
+function maybeExtend(force = false) {
+  if (!ready || q.listId || !q.songs.length) return;
+  if (!force && q.songs.length - q.index > 2) return;
+  const seed = q.songs[q.index].id;
+  if (radio.busy || radio.seeds.has(seed)) return;
+  radio.seeds.add(seed);
+  radio.busy = true;
+  const gen = q.gen;
+  showTrack();
+  harvest(seed).then((ids) => {
+    if (gen !== q.gen) return; // the queue was replaced meanwhile
+    radio.busy = false;
+    const have = new Set(q.songs.map((s) => s.id));
+    const add = ids.filter((id) => /^[\w-]{11}$/.test(id) && !have.has(id)).slice(0, 40).map((id) => ({ id, title: null, artist: '' }));
+    q.songs.push(...add);
+    if (add.length && q.fromPaste) { track('mix', { song: seed }); q.fromPaste = false; }
+    showTrack();
+    prefetch();
+    if (screen === 'menu' && stack.at(-1)?.title === 'Up Next') { stack[stack.length - 1] = upNextMenu(); renderMenu(); }
+    if (radio.advance) { radio.advance = false; next(); }
+  });
+}
+
+// Look up names for the next few songs, and drop ones that can't play here.
+function prefetch() {
+  const gen = q.gen;
+  for (const s of q.songs.slice(q.index, q.index + 8)) {
+    if (s.title || s.bad || s.fetching) continue;
+    s.fetching = true;
+    fetchMeta(s.id).then((m) => {
+      if (gen !== q.gen) return;
+      if (m === null) s.bad = true;
+      else if (m && !s.title) { s.title = m.title; s.artist = m.artist; }
+      if (s === q.songs[q.index]) showTrack();
+    });
+  }
+}
+
+function startRadio() {
+  const cur = q.listId ? current() : q.songs[q.index];
+  if (!cur?.id) return;
+  q.gen++;
+  q.listId = null;
+  q.songs = [{ id: cur.id, title: cur.title === 'Loading…' ? null : cur.title, artist: cur.artist }];
+  q.index = 0; q.name = 'Radio';
+  radio.seeds.clear(); radio.busy = false; radio.advance = false;
+  maybeExtend(true);
+  toast('Radio on: more songs like this one');
+}
+
+// Pasted songs are kept as "Your Mixes" so people can come back to them.
+function saveMix(id, title) {
+  const mixes = store.get('mixes', []).filter((m) => m.id !== id);
+  mixes.unshift({ id, title: title || 'Your song' });
+  store.set('mixes', mixes.slice(0, 12));
 }
 
 // ---------- YouTube player ----------
@@ -484,15 +661,26 @@ window.onYouTubeIframeAPIReady = () => {
         if (pending?.list) playList(pending.list, pending.autoplay);
         else if (pending?.id) load(pending.id, pending.autoplay);
         pending = null;
+        maybeExtend();
+        prefetch();
       },
       onStateChange: (e) => {
         const S = YT.PlayerState;
         root.classList.toggle('paused', e.data !== S.PLAYING && e.data !== S.BUFFERING);
-        if (e.data === S.PLAYING) { root.classList.add('playing-once', 'started'); stats.started = true; }
+        if (e.data === S.PLAYING) {
+          root.classList.add('playing-once', 'started');
+          const d = player.getVideoData?.() || {};
+          if (d.video_id && d.video_id !== lastCounted) {
+            lastCounted = d.video_id;
+            const s = q.listId ? current() : q.songs[q.index];
+            track('play', { song: d.video_id, title: (s?.title && s.title !== 'Loading…' ? s.title : d.title || '').slice(0, 160) });
+          }
+        }
         if (e.data === S.ENDED && !q.listId) next();
         showTrack();
       },
       onError: () => {
+        if (!q.listId && q.songs[q.index]) q.songs[q.index].bad = true;
         $('title').textContent = "This one can't play here";
         $('artist').textContent = 'Skipping…';
         setTimeout(next, 1500);
@@ -500,7 +688,7 @@ window.onYouTubeIframeAPIReady = () => {
     },
   });
 };
-const stats = { started: false };
+let lastCounted = null;
 
 setInterval(() => {
   if (!ready || !player.getDuration) return;
@@ -509,6 +697,7 @@ setInterval(() => {
   $('elapsed').textContent = clock(cur);
   $('remaining').textContent = dur > 0 ? `-${clock(dur - cur)}` : '-0:00';
   if (q.listId && $('title').textContent.startsWith('Loading')) showTrack();
+  if (player.getPlayerState?.() === YT.PlayerState.PLAYING) { listened += 0.25; if (listened >= 300) flushListen(); }
 }, 250);
 
 function syncVolume() {
@@ -525,7 +714,9 @@ function mainMenu() {
     index: 0,
     items: [
       { label: 'Playlists', more: true, select: () => openMenu(playlistsMenu()) },
+      { label: 'Your Mixes', more: true, select: () => openMenu(mixesMenu()) },
       { label: 'Up Next', more: true, select: () => openMenu(upNextMenu()) },
+      { label: 'Start Radio', select: () => { startRadio(); stack.length = 0; showScreen('now'); } },
       { label: 'Now Playing', select: () => showScreen('now') },
       { label: 'Shuffle Songs', select: shuffleAll },
       { label: 'Brick', select: openBrick },
@@ -542,8 +733,24 @@ function playlistsMenu() {
 function songsMenu(p) {
   return {
     title: p.name, index: 0,
-    items: p.songs.map((s, i) => ({ label: s.title, select: () => { playSongs(p.songs, i, p.name); stack.length = 0; showScreen('now'); } })),
+    items: p.songs.map((s, i) => ({ label: s.title, select: () => { playSongs(p.songs, i, p.name); track('playlist', { title: p.name }); stack.length = 0; showScreen('now'); } })),
   };
+}
+function mixesMenu() {
+  const mixes = store.get('mixes', []);
+  if (!mixes.length) return { title: 'Your Mixes', index: 0, items: [{ label: 'Paste a song below', select: () => { stack.length = 0; showScreen('now'); $('link').focus(); } }] };
+  return {
+    title: 'Your Mixes', index: 0,
+    items: mixes.map((m) => ({ label: m.title, select: () => { startMix(m.id, false, m.title); track('playlist', { title: 'Your Mixes' }); stack.length = 0; showScreen('now'); } })),
+  };
+}
+// One song in, a whole mix out: play it, then keep going with songs like it.
+function startMix(id, fromPaste, title = null) {
+  playSongs([{ id, title, artist: '' }], 0, 'Mix');
+  q.fromPaste = fromPaste;
+  q.fromPasteSeed = fromPaste ? id : null;
+  if (title) saveMix(id, title);
+  else if (fromPaste) fetchMeta(id).then((m) => saveMix(id, m?.title));
 }
 function upNextMenu() {
   if (q.listId || !q.songs.length) {
@@ -551,19 +758,21 @@ function upNextMenu() {
   }
   return {
     title: 'Up Next', index: q.index,
-    items: q.songs.map((s, i) => ({ label: s.title, select: () => { q.index = i; showTrack(); load(s.id, true); stack.length = 0; showScreen('now'); } })),
+    items: q.songs.map((s, i) => ({ label: s.bad ? '(unavailable)' : s.title || '…', select: () => { if (!s.bad) goTo(i); stack.length = 0; showScreen('now'); } })),
   };
 }
 function shuffleAll() {
   const all = PLAYLISTS.filter((p) => !p.name.includes('live')).flatMap((p) => p.songs);
   for (let i = all.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [all[i], all[j]] = [all[j], all[i]]; }
   playSongs(all, 0, 'Shuffle');
+  track('playlist', { title: 'Shuffle' });
   stack.length = 0;
   showScreen('now');
 }
 async function share() {
   const s = current();
   const url = q.listId ? `${SITE}?list=${q.listId}` : s?.id ? `${SITE}?v=${s.id}` : SITE;
+  track('share', { song: q.listId || s?.id });
   try {
     if (navigator.share && matchMedia('(pointer: coarse)').matches) await navigator.share({ title: s?.title || 'Music Focus', url });
     else { await navigator.clipboard.writeText(url); toast('Link copied'); }
@@ -752,6 +961,7 @@ function newBrickGame(best = 0) {
 }
 function openBrick() {
   showScreen('brick');
+  track('brick');
   game ??= newBrickGame(store.get('brickBest', 0));
   game.paused = false;
   if (canvas.width !== BOARD.w * BOARD.scale) { canvas.width = BOARD.w * BOARD.scale; canvas.height = BOARD.h * BOARD.scale; }
@@ -874,17 +1084,22 @@ $('add').addEventListener('submit', (e) => {
   root.classList.add('started');
   stack.length = 0;
   showScreen('now');
+  track('paste', { song: found.id || found.list });
   if (found.list) playList(found.list);
-  else playSongs([{ id: found.id, title: 'Loading…', artist: '' }], 0, 'Your song');
+  else startMix(found.id, true);
 });
 
 // For pasted songs we only know the id; fill in the title once YouTube tells us.
 setInterval(() => {
   if (!ready || q.listId) return;
   const s = q.songs[q.index];
-  if (!s || s.title !== 'Loading…') return;
+  if (!s || s.title) return;
   const d = player.getVideoData?.();
-  if (d?.video_id === s.id && d.title) { s.title = d.title; s.artist = d.author; showTrack(); }
+  if (d?.video_id === s.id && d.title) {
+    Object.assign(s, tidy(d.title, d.author));
+    showTrack();
+    if (q.index === 0 && q.fromPasteSeed === s.id) saveMix(s.id, s.title);
+  }
 }, 500);
 
 // ---------- Start ----------
@@ -894,10 +1109,11 @@ setInterval(() => {
   if (list && /^[\w-]+$/.test(list)) playList(list, false);
   else if (v && /^[\w-]{11}$/.test(v)) {
     const known = PLAYLISTS.flatMap((p) => p.songs).find((s) => s.id === v);
-    playSongs([known || { id: v, title: 'Loading…', artist: '' }], 0, 'Shared', false);
+    playSongs([known || { id: v, title: null, artist: '' }], 0, 'Shared', false);
   } else {
     playSongs(PLAYLISTS[0].songs, 0, PLAYLISTS[0].name, false);
   }
+  track('visit', { ref: referrer() });
   const s = document.createElement('script');
   s.src = 'https://www.youtube.com/iframe_api';
   document.head.append(s);
